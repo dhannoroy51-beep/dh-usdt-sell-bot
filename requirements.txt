@@ -1,5 +1,5 @@
 aiogram==2.25.1
+aiohttp==3.8.5
 aiosqlite
 pytz
 gunicorn
-aiohttp==3.9.5
