@@ -1,4 +1,5 @@
-python-telegram-bot
-python-dotenv
+aiogram==2.25.1
+aiosqlite
 pytz
-flask
+gunicorn
+aiohttp
