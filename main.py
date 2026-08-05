@@ -1,238 +1,251 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ConversationHandler, ContextTypes, filters
-from telegram.constants import ParseMode
-from config import BOT_TOKEN, ADMIN_ID, BYBIT_UID, BEP20_ADDRESS, SUPPORT_USERNAME, CHANNEL_LINK, RATES, MIN_SELL, MAX_SELL, DATA_FILE
-import datetime, pytz, json, os, re
-from flask import Flask
-import threading
+import os
+import asyncio
+import aiosqlite
+import datetime
+import pytz
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
-app = Flask(__name__)
+# ===== ENV থেকে সব নিবে =====
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME") # @dhannoRoy51
+BEP20_ADDRESS = os.getenv("BEP20_ADDRESS")
+BYBIT_UID = os.getenv("BYBIT_UID")
+CHANNEL_LINK = os.getenv("CHANNEL_LINK") # https://t.me/tomar_channel
 
-@app.route('/')
-def home():
-    return "Bot is Running"
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
+DB_NAME = "orders.db"
+BD_TZ = pytz.timezone('Asia/Dhaka')
 
-def run_flask():
-    app.run(host='0.0.0.0', port=10000)
-BD_TZ = pytz.timezone("Asia/Dhaka")
-
-PENDING_ORDERS = {}
-ORDER_HISTORY = {}
-ORDER_COUNTER = 1
-
-SELL_NET, SELL_AMOUNT, SELL_PHOTO, USER_PHONE, ADMIN_REJECT_REASON = range(5)
-
-def get_time():
-    return datetime.datetime.now(BD_TZ).strftime("%d-%m-%Y %I:%M %p") # BD Time
+class Form(StatesGroup):
+    amount = State()
+    network = State()
+    wallet_address = State()
+    wallet_type = State()
+    wallet_number = State()
+    screenshot = State()
+    reject_reason = State()
 
 def get_rate(amount):
-    if MIN_SELL <= amount <= 0.99: return RATES["0.1-0.99"]
-    elif 1 <= amount <= 1.49: return RATES["1-1.49"]
-    elif 1.5 <= amount <= MAX_SELL: return RATES["1.5-10"]
-    else: return None
+    if 0.15 <= amount <= 0.99: return 122
+    elif 1.0 <= amount <= 3.99: return 125
+    elif 4.0 <= amount <= 10.0: return 127.5
+    else: return 0
 
-def load_data():
-    global PENDING_ORDERS, ORDER_HISTORY, ORDER_COUNTER
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f: data = json.load(f)
-        PENDING_ORDERS = {int(k):v for k,v in data.get("pending", {}).items()}
-        ORDER_HISTORY = {int(k):v for k,v in data.get("history", {}).items()}
-        ORDER_COUNTER = data.get("counter", 1)
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('''CREATE TABLE IF NOT EXISTS orders
+            (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT,
+            amount REAL, bdt REAL, rate REAL, status TEXT, payment_status TEXT, date TEXT, time TEXT,
+            network TEXT, wallet_address TEXT, wallet_type TEXT, wallet_number TEXT, screenshot TEXT, reject_reason TEXT)''')
+        await db.commit()
 
-def save_data():
-    with open(DATA_FILE, "w") as f: 
-        json.dump({"pending": PENDING_ORDERS, "history": ORDER_HISTORY, "counter": ORDER_COUNTER }, f)
+def main_kb():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(KeyboardButton("i. Support 💬"), KeyboardButton("ii. History 📁"))
+    kb.add(KeyboardButton("iii. Rate 💰"), KeyboardButton("iv. Sell 💵"))
+    return kb
 
-def save_to_history(order_id):
-    ORDER_HISTORY[order_id] = PENDING_ORDERS[order_id].copy()
-    save_data()
+def admin_kb():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(KeyboardButton("1. Pending Order"))
+    kb.add(KeyboardButton("2. History"), KeyboardButton("3. Pending Payment"))
+    return kb
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [["i. Support 💬", "ii. History 📜"], ["iii. Rate 💰", "iv. Sell 💵"]]
-    msg = f"✨ **স্বাগতম @{update.effective_user.username} Dh USDT Sell Bot এ** ✨\n\n"
-    msg += f"💵 **রেঞ্জ:** `{MIN_SELL}$` থেকে `{MAX_SELL}$` পর্যন্ত USDT Sell\n"
-    msg += f"📊 অর্ডার করার আগে `iii. Rate` বাটন দিয়ে আজকের রেট দেখে নিন\n"
-    msg += f"🔢 **নোট:** শুধুমাত্র Round Figure Amount পেমেন্ট করা হয়\n"
-    msg += f"📞 Wallet Number অবশ্যই আপনার Personal 11 Digit হতে হবে\n"
-    await update.message.reply_text(msg, reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True), parse_mode=ParseMode.MARKDOWN)
+# ===== USER PANEL =====
+@dp.message_handler(commands=['start'])
+async def start(message: types.Message):
+    text = f"""✨ স্বাগতম @{message.from_user.username} Dh USDT Sell Bot এ ✨
+💰 রেঞ্জ: 0.15 $ থেকে 10 $ পর্যন্ত USDT Sell
+📊 অর্ডার করার আগে iii. Rate বাটন দিয়ে আজকের রেট দেখে নিন"""
+    await message.answer(text, reply_markup=main_kb())
 
-async def user_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text; user_id = update.effective_user.id
-    if text == "i. Support 💬":
-        keyboard = [[InlineKeyboardButton("💬 Admin কে মেসেজ করুন", url=f"https://t.me/{SUPPORT_USERNAME.replace('@','')}")], [InlineKeyboardButton("📢 আমাদের Channel", url=CHANNEL_LINK)]]
-        await update.message.reply_text("**সাপোর্ট প্রয়োজন? নিচের বাটনে ক্লিক করুন:**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-    elif text == "ii. History 📜":
-        user_orders = {k:v for k,v in ORDER_HISTORY.items() if v['user_id'] == user_id}
-        if not user_orders: return await update.message.reply_text("📜 **আপনার এখনো কোনো Order নাই।**", parse_mode=ParseMode.MARKDOWN)
-        history_text = "📜 **আপনার Last 10 টি Order:**\n\n"; count = 0
-        for order_id, data in sorted(user_orders.items(), reverse=True):
-            if count >= 10: break
-            emoji = "✅" if data['status'] == "COMPLETED" else "❌" if data['status'] == "REJECTED" else "⏳"
-            reason = f"\n**কারণ:** {data.get('reason', '-')}" if data['status'] == "REJECTED" else ""
-            history_text += f"{emoji} **Order #{order_id}**\n**Date:** `{data['time']}`\n**Amount:** `{data['amount']}$` = `{data['bdt']} BDT`\n**Status:** **{data['status']}**{reason}\n\n"; count += 1
-        await update.message.reply_text(history_text, parse_mode=ParseMode.MARKDOWN)
-    elif text == "iii. Rate 💰":
-        msg = f"💰 **আজকের রেট:**\n`0.1$ - 0.99$` = **{RATES['0.1-0.99']} BDT**\n`1$ - 1.49$` = **{RATES['1-1.49']} BDT**\n`1.5$ - 10$` = **{RATES['1.5-10']} BDT**\n*Min: {MIN_SELL} USDT | Max: {MAX_SELL} USDT*"
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-    elif text == "iv. Sell 💵":
-        keyboard = [[InlineKeyboardButton("BEP-20", callback_data="net_BEP20")], [InlineKeyboardButton("Bybit", callback_data="net_Bybit")], [InlineKeyboardButton("❌ Cancel", callback_data="cancel_sell")]]
-        msg = await update.message.reply_text("**আপনি যে মাধ্যমে পেমেন্ট করবেন, তা নির্বাচন করুন ।**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-        context.user_data["last_msg_id"] = msg.message_id; return SELL_NET
+@dp.message_handler(text="i. Support 💬")
+async def support(message: types.Message):
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("👨‍💼 Admin কে Message দিন", url=f"https://t.me/{SUPPORT_USERNAME.replace('@','')}"))
+    kb.add(InlineKeyboardButton("📢 Channel", url=CHANNEL_LINK))
+    await message.answer("📞 যেকোনো সমস্যায় নিচের বাটনে ক্লিক করুন:", reply_markup=kb)
 
-async def sell_network(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    if query.data == "cancel_sell": await query.edit_message_text("❌ **Sell বাতিল করা হয়েছে।**", parse_mode=ParseMode.MARKDOWN); return ConversationHandler.END
-    context.user_data["network"] = query.data.split("_")[1]
-    keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_sell")]]
-    await query.edit_message_text(f"আপনি সিলেক্ট করেছেন: **{context.user_data['network']}**\n\n**কত $ Sell করবেন?** শুধু নাম্বার দিন।\n*Min: {MIN_SELL} | Max: {MAX_SELL}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-    return SELL_AMOUNT
+@dp.message_handler(text="ii. History 📁")
+async def history(message: types.Message):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT id, amount, bdt, rate, status, date, time, wallet_type, reject_reason FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 15", (message.from_user.id,)) as cursor:
+            rows = await cursor.fetchall()
+    if not rows: await message.answer("📜 আপনার কোনো Order History নাই"); return
+    text = "📜 আপনার Last 15 টা Order:\n\n"
+    for row in rows:
+        status_emoji = "✅" if row[4]=="Approved" else "❌" if row[4]=="Rejected" else "⏳"
+        text += f"{status_emoji} #{row[0]} | {row[5]} {row[6]} BD\n@{message.from_user.username}\n{row[1]}$ x {row[3]}৳ = {row[2]} BDT\nWallet: {row[7]}\n"
+        if row[4] == "Rejected": text += f"কারণ: {row[8]}\n"
+        text += "\n"
+    await message.answer(text)
 
-async def get_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try: amount = float(update.message.text)
-    except: return await update.message.reply_text("❌ **শুধু নাম্বার দিন। যেমন:** `5.5`", parse_mode=ParseMode.MARKDOWN)
-    if amount < MIN_SELL or amount > MAX_SELL: return await update.message.reply_text(f"❌ **Amount {MIN_SELL} থেকে {MAX_SELL} USDT এর মধ্যে হতে হবে।**", parse_mode=ParseMode.MARKDOWN)
-    rate = get_rate(amount)
-    if not rate: return await update.message.reply_text("❌ **এই Amount এর জন্য Rate নাই।**", parse_mode=ParseMode.MARKDOWN)
-    context.user_data["amount"] = amount; context.user_data["rate"] = rate; bdt = int(amount * rate); network = context.user_data["network"]
-    keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_sell")]]
-    if network == "BEP20": text = f"📍 **BEP-20 Address:** `{BEP20_ADDRESS}`\n\n⚠️ **শুধু BEP-20 Network**\n💰 **Amount:** `{amount}$` USDT\n💵 **Rate:** `{rate}` BDT\n💸 **Total:** `{bdt}` BDT\n📸 পেমেন্ট Screenshot আপলোড করুন"
-    else: text = f"📍 **Bybit UID:** `{BYBIT_UID}`\n\n⚠️ **Memo লাগবে না**\n💰 **Amount:** `{amount}$` USDT\n💵 **Rate:** `{rate}` BDT\n💸 **Total:** `{bdt}` BDT\n📸 পেমেন্ট Screenshot আপলোড করুন"
-    await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=context.user_data["last_msg_id"], text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-    return SELL_PHOTO
+@dp.message_handler(text="iii. Rate 💰")
+async def rate(message: types.Message):
+    text = f"""📊 আজকের Rate Chart:
+💵 0.15$ - 0.99$ = 122৳
+💵 1.00$ - 3.99$ = 125৳
+💵 4.00$ - 10.0$ = 127.5৳"""
+    await message.answer(text)
 
-async def get_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global ORDER_COUNTER; order_id = ORDER_COUNTER; ORDER_COUNTER += 1
-    context.user_data["photo_id"] = update.message.photo[-1].file_id
-    PENDING_ORDERS[order_id] = {"user_id": update.effective_user.id, "username": update.effective_user.username, "network": context.user_data["network"], "amount": context.user_data["amount"], "rate": context.user_data["rate"], "bdt": int(context.user_data["amount"] * context.user_data["rate"]), "photo_id": context.user_data["photo_id"], "status": "PENDING", "time": get_time()} # BD Time Save
-    save_data()
-    await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=context.user_data["last_msg_id"], text=f"✅ **Order Admin এর কাছে পাঠানো হয়েছে**\n\n`30 মিনিট থেকে 24 ঘন্টার` মধ্যে Admin যাচাই করবে", parse_mode=ParseMode.MARKDOWN)
-    admin_text = f"🆕 **নতুন Order #{order_id}**\n👤 **User:** @{PENDING_ORDERS[order_id]['username']}\n🆔 **ID:** `{PENDING_ORDERS[order_id]['user_id']}`\n🌐 **Network:** {PENDING_ORDERS[order_id]['network']}\n💰 **Amount:** `{PENDING_ORDERS[order_id]['amount']}` USDT\n💵 **Rate:** `{PENDING_ORDERS[order_id]['rate']}` BDT\n💸 **Total:** `{PENDING_ORDERS[order_id]['bdt']}` BDT\n⏰ **Time:** {PENDING_ORDERS[order_id]['time']}"
-    keyboard = [[InlineKeyboardButton("✅ Approve", callback_data=f"app_{order_id}")], [InlineKeyboardButton("❌ Reject", callback_data=f"rej_{order_id}")]]
-    await context.bot.send_photo(chat_id=ADMIN_ID, photo=PENDING_ORDERS[order_id]['photo_id'], caption=admin_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-    return ConversationHandler.END
+@dp.message_handler(text="iv. Sell 💵")
+async def sell_start(message: types.Message):
+    await message.answer("💵 কত USDT Sell করবেন? \nMin: 0.15$ - Max: 10$\nশুধু সংখ্যা লিখুন।")
+    await Form.amount.set()
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    await query.edit_message_text("❌ **Sell বাতিল করা হয়েছে।**", parse_mode=ParseMode.MARKDOWN)
-    return ConversationHandler.END
+@dp.message_handler(state=Form.amount)
+async def process_amount(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text)
+        rate = get_rate(amount)
+        if rate == 0: await message.answer("❌ Amount 0.15 থেকে 10 এর মধ্যে হতে হবে"); return
+        bdt = round(amount * rate)
+        await state.update_data(amount=amount, bdt=bdt, rate=rate)
+        kb = InlineKeyboardMarkup().add(InlineKeyboardButton("BEP-20", callback_data="BEP-20")).add(InlineKeyboardButton("Bybit UID", callback_data="Bybit"))
+        await message.answer(f"আপনি {amount}$ Sell করবেন\nRate: {rate}৳\nমোট পাবেন: {bdt} BDT\n🌐 কোন Network এ পাঠাবেন?", reply_markup=kb)
+        await Form.network.set()
+    except: await message.answer("❌ সঠিক সংখ্যা লিখুন।")
 
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id!= ADMIN_ID: return
-    keyboard = [["Pending 📝", "History 📜"]]
-    await update.message.reply_text("👑 **Admin Panel**", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True), parse_mode=ParseMode.MARKDOWN)
+@dp.callback_query_handler(state=Form.network)
+async def process_network(call: types.CallbackQuery, state: FSMContext):
+    await call.answer(); network = call.data; await state.update_data(network=network)
+    if network == "BEP-20": await call.message.answer(f"📩 আমাদের BEP-20 Address:\n`{BEP20_ADDRESS}`\n\nUSDT পাঠিয়ে Screenshot দিন", parse_mode="Markdown")
+    else: await call.message.answer(f"📩 আমাদের Bybit UID:\n`{BYBIT_UID}`\n\nUSDT পাঠিয়ে Screenshot দিন", parse_mode="Markdown")
+    await Form.wallet_address.set()
 
-async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id!= ADMIN_ID: return
-    text = update.message.text
-    if text == "Pending 📝":
-        pending = [f"**#{k}:** @{v['username']} - `{v['amount']}$` - `{v['time']}`" for k,v in PENDING_ORDERS.items() if v['status']=='PENDING'] # Time Add
-        msg = "📝 **Pending Orders:**\n" + ("\n".join(pending) if pending else "কোনো Pending Order নাই")
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-    elif text == "History 📜":
-        if not ORDER_HISTORY: return await update.message.reply_text("📜 **History নাই।**", parse_mode=ParseMode.MARKDOWN)
-        history_text = "📜 **Last 10 Orders:**\n\n"; count = 0
-        for order_id, data in sorted(ORDER_HISTORY.items(), reverse=True):
-            if count >= 10: break
-            if data['status'] == "COMPLETED": 
-                history_text += f"✅ **#{order_id}**\n👤 @{data['username']}\n⏰ `{data['time']}`\n`{data['amount']}$` = `{data['bdt']} BDT`\n💳 {data.get('wallet_type', '-')}: `{data.get('phone', '-')}`\n\n" # Time Added
-            elif data['status'] == "REJECTED": 
-                history_text += f"❌ **#{order_id}**\n👤 @{data['username']}\n⏰ `{data['time']}`\n`{data['amount']}$`\nকারণ: {data.get('reason', '-')}\n\n" # Time Added
-            count += 1
-        await update.message.reply_text(history_text, parse_mode=ParseMode.MARKDOWN)
+@dp.message_handler(state=Form.wallet_address)
+async def process_wallet(message: types.Message, state: FSMContext):
+    await state.update_data(wallet_address=message.text)
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True).add("Bkash", "Nagad", "Rocket")
+    await message.answer("💳 কোন Wallet এ টাকা নিবেন?", reply_markup=kb)
+    await Form.wallet_type.set()
 
-async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer(); data = query.data
-    if data.startswith("app_"):
-        order_id = int(data.split("_")[1]); PENDING_ORDERS[order_id]["status"] = "APPROVED"; save_to_history(order_id)
-        bdt_amount = PENDING_ORDERS[order_id]['bdt']
-        keyboard = [[InlineKeyboardButton("Bkash", callback_data=f"wall_Bkash_{order_id}")]]
-        if bdt_amount >= 50: keyboard.append([InlineKeyboardButton("Nagad", callback_data=f"wall_Nagad_{order_id}")])
-        keyboard.append([InlineKeyboardButton("Rocket", callback_data=f"wall_Rocket_{order_id}")])
-        msg = await context.bot.send_message(chat_id=PENDING_ORDERS[order_id]['user_id'], text="✅ **Order Approved!**\n\n**টাকা নেওয়ার জন্য Mobile Wallet সিলেক্ট করুন:**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-        PENDING_ORDERS[order_id]["wallet_msg_id"] = msg.message_id
-        
-        admin_pay_text = f"💰 **Payment Waiting #{order_id}**\n👤 **User:** @{PENDING_ORDERS[order_id]['username']}\n⏰ **Time:** {PENDING_ORDERS[order_id]['time']}\n💵 **Amount:** `{PENDING_ORDERS[order_id]['bdt']} BDT`\n📱 **Number:** `Pending...`\n\nUser Wallet সিলেক্ট করার পর এখানে দেখাবে" # Time Add
-        pay_keyboard = [[InlineKeyboardButton("✏️ Number Update", callback_data=f"num_{order_id}")]]
-        await query.edit_message_caption(caption=admin_pay_text, reply_markup=InlineKeyboardMarkup(pay_keyboard), parse_mode=ParseMode.MARKDOWN); save_data()
+@dp.message_handler(state=Form.wallet_type)
+async def process_wallet_type(message: types.Message, state: FSMContext):
+    if message.text not in ["Bkash", "Nagad", "Rocket"]: await message.answer("শুধু Bkash / Nagad / Rocket লিখুন"); return
+    await state.update_data(wallet_type=message.text)
+    await message.answer("📱 11 Digit Mobile Number দিন", reply_markup=types.ReplyKeyboardRemove())
+    await Form.wallet_number.set()
 
-    elif data.startswith("rej_"):
-        context.user_data["reject_id"] = int(data.split("_")[1]); await query.message.reply_text("❌ **Reject এর কারণ লিখুন:**", parse_mode=ParseMode.MARKDOWN); return ADMIN_REJECT_REASON
-    
-    elif data.startswith("wall_"): 
-        parts = data.split("_"); wallet = parts[1]; order_id = int(parts[2])
-        PENDING_ORDERS[order_id]["wallet_type"] = wallet; save_data()
-        msg_id = PENDING_ORDERS[order_id]["wallet_msg_id"]
-        await context.bot.edit_message_text(
-            chat_id=PENDING_ORDERS[order_id]['user_id'], 
-            message_id=msg_id, 
-            text=f"✅ **Order Approved!**\n\nআপনি **{wallet}** সিলেক্ট করেছেন।\n\n**এখন 11 Digit Mobile Number দিন:**\nউদাহরণ: `017XXXXXXXXX`", 
-            parse_mode=ParseMode.MARKDOWN, 
-            reply_markup=None
-        )
-        return USER_PHONE
+@dp.message_handler(state=Form.wallet_number)
+async def process_number(message: types.Message, state: FSMContext):
+    if not message.text.isdigit() or len(message.text)!= 11: await message.answer("❌ 11 Digit নাম্বার দিন।"); return
+    await state.update_data(wallet_number=message.text)
+    await message.answer("📸 এখন Payment এর Screenshot পাঠান")
+    await Form.screenshot.set()
 
-    elif data.startswith("num_"):
-        context.user_data["update_num_order"] = int(data.split("_")[1])
-        await query.message.reply_text(f"**Order #{context.user_data['update_num_order']} এর জন্য সঠিক 11 Digit নাম্বার লিখুন:**", parse_mode=ParseMode.MARKDOWN)
-        return ADMIN_REJECT_REASON
-    
-    elif data.startswith("paid_"):
-        order_id = int(data.split("_")[1]); PENDING_ORDERS[order_id]["status"] = "COMPLETED"; save_to_history(order_id)
-        await context.bot.send_message(chat_id=PENDING_ORDERS[order_id]['user_id'], text=f"✅ **Payment Completed #{order_id}**\nআপনার `{PENDING_ORDERS[order_id]['bdt']} BDT` পাঠানো হয়েছে।\nধন্যবাদ ❤️", parse_mode=ParseMode.MARKDOWN)
-        await query.edit_message_text(f"✅ **Payment Sent**\n**Order:** #{order_id}\n**User:** @{PENDING_ORDERS[order_id]['username']}\n⏰ **Time:** {PENDING_ORDERS[order_id]['time']}\n**Amount:** `{PENDING_ORDERS[order_id]['bdt']} BDT`\n**Wallet:** {PENDING_ORDERS[order_id]['wallet_type']} `{PENDING_ORDERS[order_id]['phone']}`\n**Status:** COMPLETED", parse_mode=ParseMode.MARKDOWN); save_data() # Time Add
+@dp.message_handler(content_types=['photo'], state=Form.screenshot)
+async def process_screenshot(message: types.Message, state: FSMContext):
+    data = await state.get_data(); now = datetime.datetime.now(BD_TZ); date = now.strftime("%Y-%m-%d"); time = now.strftime("%H:%M:%S")
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("INSERT INTO orders VALUES (NULL,?,?,?,?,?, 'Pending','Unpaid',?,?,?,?,?,?,?,?,?)",
+            (message.from_user.id, message.from_user.username, data['amount'], data['bdt'], data['rate'], date, time,
+             data['network'], data['wallet_address'], data['wallet_type'], data['wallet_number'], message.photo[-1].file_id, None))
+        await db.commit()
+        async with db.execute("SELECT last_insert_rowid()") as cursor: order_id = (await cursor.fetchone())[0]
+    await message.answer("✅ Order Submit হয়েছে। 15 মিনিটের মধ্যে টাকা পেয়ে যাবেন।", reply_markup=main_kb())
+    text = f"🆕 নতুন Order #{order_id}\n👤 @{message.from_user.username}\nID: {message.from_user.id}\n💵 {data['amount']}$ x {data['rate']}৳ = {data['bdt']} BDT\n🌐 {data['network']}\n💳 {data['wallet_type']}: {data['wallet_number']}\n📅 {date} {time} BD"
+    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("Approve ✅", callback_data=f"approve_{order_id}")).add(InlineKeyboardButton("Reject ❌", callback_data=f"reject_{order_id}"))
+    await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=text, reply_markup=kb)
+    await state.finish()
 
-async def get_wallet_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip().replace(" ", "")
-    if not re.match(r"^01[3-9]\d{8}$", phone):
-        return await update.message.reply_text("❌ **ভুল নাম্বার!**\nঅবশ্যই 11 Digit হতে হবে এবং `01` দিয়ে শুরু হতে হবে।\nউদাহরণ: `017XXXXXXXXX`\n\n**আবার সঠিক নাম্বার দিন:**", parse_mode=ParseMode.MARKDOWN)
-    user_id = update.effective_user.id
-    order_id = None
-    for k, v in PENDING_ORDERS.items():
-        if v['user_id'] == user_id and v['status'] == 'APPROVED': order_id = k; break
-    if not order_id: return await update.message.reply_text("❌ **Order পাওয়া যায়নি। আবার /start দিন।**")
-    PENDING_ORDERS[order_id]["phone"] = phone; PENDING_ORDERS[order_id]["status"] = "WAITING_PAYMENT"; save_data()
-    o = PENDING_ORDERS[order_id]
-    keyboard = [[InlineKeyboardButton("💰 Payment Sent", callback_data=f"paid_{order_id}")]]
-    admin_text = f"💰 **Payment Request #{order_id}**\n👤 **User:** @{o['username']}\n⏰ **Time:** {o['time']}\n💳 **Wallet:** {o['wallet_type']}\n📱 **Number:** `{o['phone']}`\n💵 **Amount:** `{o['amount']}` USDT x `{o['rate']}` BDT = **`{o['bdt']} BDT`**\n\nটাকা পাঠিয়ে নিচের বাটনে চাপ দিন।" # Time Add
-    await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-    await update.message.reply_text("✅ **Admin `15 মিনিট থেকে 30 মিনিটের` মধ্যে Payment Complete করবে ।**\nদয়া করে অপেক্ষা করুন ।", parse_mode=ParseMode.MARKDOWN)
-    return ConversationHandler.END
+# ===== ADMIN PANEL =====
+@dp.message_handler(commands=['admin'])
+async def admin_panel(message: types.Message):
+    if message.from_user.id == ADMIN_ID: await message.answer("Admin Panel", reply_markup=admin_kb())
 
-async def reject_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if "update_num_order" in context.user_data:
-        order_id = context.user_data["update_num_order"]
-        phone = text.strip().replace(" ", "")
-        if not re.match(r"^01[3-9]\d{8}$", phone): return await update.message.reply_text("❌ 11 Digit নাম্বার দিন।")
-        PENDING_ORDERS[order_id]["phone"] = phone; PENDING_ORDERS[order_id]["status"] = "WAITING_PAYMENT"; save_data()
-        del context.user_data["update_num_order"]
-        o = PENDING_ORDERS[order_id]
-        keyboard = [[InlineKeyboardButton("💰 Payment Sent", callback_data=f"paid_{order_id}")]]
-        admin_text = f"💰 **Payment Request #{order_id}**\n👤 **User:** @{o['username']}\n⏰ **Time:** {o['time']}\n💳 **Wallet:** {o['wallet_type']}\n📱 **Number:** `{o['phone']}`\n💵 **Amount:** `{o['amount']}` USDT x `{o['rate']}` BDT = **`{o['bdt']} BDT`**\n\nটাকা পাঠিয়ে নিচের বাটনে চাপ দিন।" # Time Add
-        await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-        await update.message.reply_text("✅ **নাম্বার Update হয়েছে। এখন Payment করতে পারবেন।**")
-        return ConversationHandler.END
-    else:
-        order_id = context.user_data["reject_id"]; reason = text
-        PENDING_ORDERS[order_id]["status"] = "REJECTED"; PENDING_ORDERS[order_id]["reason"] = reason; save_to_history(order_id)
-        await context.bot.send_message(chat_id=PENDING_ORDERS[order_id]['user_id'], text=f"❌ **Order #{order_id} Reject হয়েছে।**\n**কারণ:** {reason}", parse_mode=ParseMode.MARKDOWN)
-        await update.message.reply_text("✅ **Reject করা হয়েছে।**", parse_mode=ParseMode.MARKDOWN); save_data()
-        return ConversationHandler.END
+@dp.message_handler(text="1. Pending Order")
+async def pending_orders(message: types.Message):
+    if message.from_user.id!= ADMIN_ID: return
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT id, username, amount, bdt, rate, date, time, network, wallet_type, wallet_number FROM orders WHERE status='Pending' ORDER BY id DESC") as cursor: rows = await cursor.fetchall()
+    if not rows: await message.answer("📭 কোনো Pending Order নাই"); return
+    for row in rows:
+        text = f"🆕 Order #{row[0]}\n👤 @{row[1]}\n💵 {row[2]}$ x {row[4]}৳ = {row[3]} BDT\n🌐 {row[7]}\n💳 {row[8]}: {row[9]}\n📅 {row[5]} {row[6]} BD"
+        kb = InlineKeyboardMarkup().add(InlineKeyboardButton("Approve ✅", callback_data=f"approve_{row[0]}")).add(InlineKeyboardButton("Reject ❌", callback_data=f"reject_{row[0]}"))
+        await message.answer(text, reply_markup=kb)
 
-def main():
-    load_data(); print(f"✅ {len(ORDER_HISTORY)} টি পুরাতন Order Load হয়েছে")
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    sell_conv = ConversationHandler(entry_points=[CallbackQueryHandler(sell_network, pattern="^(net_|cancel_sell)")], states={ SELL_NET:[], SELL_AMOUNT:[MessageHandler(filters.TEXT & ~filters.COMMAND, get_amount), CallbackQueryHandler(cancel, pattern="^cancel_sell")], SELL_PHOTO:[MessageHandler(filters.PHOTO, get_photo), CallbackQueryHandler(cancel, pattern="^cancel_sell")] }, fallbacks=[])
-    phone_conv = ConversationHandler(entry_points=[CallbackQueryHandler(admin_callback, pattern="^wall_")], states={USER_PHONE:[MessageHandler(filters.TEXT & ~filters.COMMAND, get_wallet_phone)]}, fallbacks=[])
-    reject_conv = ConversationHandler(entry_points=[CallbackQueryHandler(admin_callback, pattern="^(rej_|num_)")], states={ADMIN_REJECT_REASON:[MessageHandler(filters.TEXT & ~filters.COMMAND, reject_reason)]}, fallbacks=[])
-    app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('admin', admin))
-    app.add_handler(sell_conv); app.add_handler(phone_conv); app.add_handler(reject_conv)
-    app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(app_|rej_|wall_|paid_|num_)"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(user_id=ADMIN_ID), admin_menu))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, user_menu))
-    print("🤖 Bot Running v15.2 - Admin History BD Time Added")
-    threading.Thread(target=run_flask, daemon=True).start()  # নতুন এই লাইন
-    app.run_polling()
+@dp.message_handler(text="2. History")
+async def admin_history(message: types.Message):
+    if message.from_user.id!= ADMIN_ID: return
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT id, username, amount, bdt, rate, status, payment_status, date, time, wallet_type, wallet_number, reject_reason FROM orders ORDER BY id DESC LIMIT 20") as cursor: rows = await cursor.fetchall()
+    if not rows: await message.answer("কোনো History নাই"); return
+    text = "📜 Admin History - Last 20 Orders:\n\n"
+    for row in rows:
+        status_emoji = "✅" if row[5]=="Approved" else "❌" if row[5]=="Rejected" else "⏳"
+        pay_emoji = "💰" if row[6]=="Paid" else "⏳"
+        text += f"{status_emoji}{pay_emoji} #{row[0]} | {row[7]} {row[8]} BD\n@{row[1]} | {row[2]}$ x {row[4]}৳ = {row[3]} BDT\n"
+        if row[5]=="Approved": text += f"Wallet: {row[9]} {row[10]}\n"
+        if row[5]=="Rejected": text += f"কারণ: {row[11]}\n"
+        text += "\n"
+    await message.answer(text)
 
-if __name__ == "__main__": main()
+@dp.message_handler(text="3. Pending Payment")
+async def pending_payment(message: types.Message):
+    if message.from_user.id!= ADMIN_ID: return
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT id, username, amount, bdt, date, time, wallet_type, wallet_number FROM orders WHERE status='Approved' AND payment_status='Unpaid' ORDER BY id DESC") as cursor: rows = await cursor.fetchall()
+    if not rows: await message.answer("💰 সব Payment Done"); return
+    for row in rows:
+        text = f"💰 Payment Pending #{row[0]}\n👤 @{row[1]}\n💵 {row[2]}$ = {row[3]} BDT\n💳 {row[6]}: {row[7]}\n📅 {row[4]} {row[5]} BD"
+        kb = InlineKeyboardMarkup().add(InlineKeyboardButton("Payment Sent ✅", callback_data=f"paid_{row[0]}"))
+        await message.answer(text, reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith('approve_'))
+async def approve(call: types.CallbackQuery):
+    if call.from_user.id!= ADMIN_ID: return
+    order_id = call.data.split('_')[1]
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE orders SET status='Approved' WHERE id=?", (order_id,))
+        await db.commit()
+        async with db.execute("SELECT user_id, wallet_type FROM orders WHERE id=?", (order_id,)) as cursor: user_id, wallet_type = await cursor.fetchone()
+    await bot.send_message(user_id, f"✅ Order #{order_id} Approved!\n15 মিনিটের মধ্যে {wallet_type} এ টাকা পেয়ে যাবেন।")
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.edit_text(call.message.text + "\n\n✅ Approved")
+
+@dp.callback_query_handler(lambda c: c.data.startswith('reject_'))
+async def reject(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id!= ADMIN_ID: return
+    order_id = call.data.split('_')[1]
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer("Reject এর কারণ লিখুন:")
+    await Form.reject_reason.set()
+    await state.update_data(order_id=order_id, msg_id=call.message.message_id)
+
+@dp.message_handler(state=Form.reject_reason)
+async def process_reject(message: types.Message, state: FSMContext):
+    data = await state.get_data(); order_id = data['order_id']
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE orders SET status='Rejected', reject_reason=? WHERE id=?", (message.text, order_id))
+        await db.commit()
+        async with db.execute("SELECT user_id FROM orders WHERE id=?", (order_id,)) as cursor: user_id = (await cursor.fetchone())[0]
+    await bot.send_message(user_id, f"❌ Order #{order_id} Rejected\nকারণ: {message.text}")
+    await bot.edit_message_text(f"{(await bot.get_message(ADMIN_ID, data['msg_id'])).text}\n\n❌ Rejected: {message.text}", ADMIN_ID, data['msg_id'])
+    await message.answer("Reject করা হয়েছে")
+    await state.finish()
+
+@dp.callback_query_handler(lambda c: c.data.startswith('paid_'))
+async def payment_done(call: types.CallbackQuery):
+    if call.from_user.id!= ADMIN_ID: return
+    order_id = call.data.split('_')[1]
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE orders SET payment_status='Paid' WHERE id=?", (order_id,))
+        await db.commit()
+        async with db.execute("SELECT user_id FROM orders WHERE id=?", (order_id,)) as cursor: user_id = (await cursor.fetchone())[0]
+    await bot.send_message(user_id, f"💰 Order #{order_id} এর Payment Sent করা হয়েছে। Check করুন।")
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.edit_text(call.message.text + "\n\n✅ Payment Sent")
+
+async def on_startup(_): await init_db()
+
+if __name__ == '__main__':
+    from aiogram import executor
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
