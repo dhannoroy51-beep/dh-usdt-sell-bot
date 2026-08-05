@@ -3,7 +3,17 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Cal
 from telegram.constants import ParseMode
 from config import BOT_TOKEN, ADMIN_ID, BYBIT_UID, BEP20_ADDRESS, SUPPORT_USERNAME, CHANNEL_LINK, RATES, MIN_SELL, MAX_SELL, DATA_FILE
 import datetime, pytz, json, os, re
+from flask import Flask
+import threading
 
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is Running"
+
+def run_flask():
+    app.run(host='0.0.0.0', port=10000)
 BD_TZ = pytz.timezone("Asia/Dhaka")
 
 PENDING_ORDERS = {}
@@ -222,6 +232,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(user_id=ADMIN_ID), admin_menu))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, user_menu))
     print("🤖 Bot Running v15.2 - Admin History BD Time Added")
+    threading.Thread(target=run_flask, daemon=True).start()  # নতুন এই লাইন
     app.run_polling()
 
 if __name__ == "__main__": main()
